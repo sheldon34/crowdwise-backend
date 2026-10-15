@@ -9,6 +9,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -31,6 +32,8 @@ DB_PATH = os.getenv("DB_PATH", "./crowd.db")
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "congestion").strip("/")
+MQTT_ONLINE_SUFFIX = os.getenv("MQTT_ONLINE_SUFFIX", "online").strip("/")
+MQTT_COUNTS_SUFFIX = os.getenv("MQTT_COUNTS_SUFFIX", "counts").strip("/")
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
 STALE_MS = int(os.getenv("STALE_MS", "60000"))
 MODES = ("normal", "evacuation")
@@ -78,7 +81,6 @@ VALUES (:zone, :ts, :devices, :real_devices, :rand_devices, :smoothed, :people, 
 # ---------- Live stream (SSE) ----------
 subscribers: set = set()
 main_loop: Optional[asyncio.AbstractEventLoop] = None
-zone_online: dict[str, bool] = {}
 
 
 def broadcast(event: str, data: dict) -> None:
@@ -113,31 +115,26 @@ def num(v) -> Optional[float]:
 
 
 def normalize(p: Any, zone_hint: Optional[str] = None) -> Optional[dict]:
-    """Validate and normalize a counts payload without supplying missing values."""
-    required = {"devices", "real", "rand", "smoothed", "people", "level"}
-    if not isinstance(p, dict) or set(p) != required:
+    """Normalise {"devices":56,"real":30,"rand":26,"smoothed":58.2,"people":58.2,"level":"HIGH"}"""
+    if not isinstance(p, dict):
         return None
     devices = num(p.get("devices"))
-    real_devices = num(p.get("real"))
-    rand_devices = num(p.get("rand"))
-    smoothed = num(p.get("smoothed"))
     people = num(p.get("people"))
-    level = p.get("level")
-    if (
-        any(value is None or value < 0 for value in (devices, real_devices, rand_devices, smoothed, people))
-        or not isinstance(level, str)
-        or not level
-    ):
+    if people is None:
+        people = num(p.get("smoothed"))
+    if devices is None or people is None:
         return None
+    smoothed = num(p.get("smoothed"))
+    ts = num(p.get("ts"))
     return {
-        "zone": zone_hint,
-        "ts": now_ms(),
+        "zone": str(p.get("zone") or zone_hint or "default")[:64],
+        "ts": int(ts) if ts is not None else now_ms(),
         "devices": devices,
-        "real_devices": real_devices,
-        "rand_devices": rand_devices,
-        "smoothed": smoothed,
+        "real_devices": num(p.get("real")),
+        "rand_devices": num(p.get("rand")),
+        "smoothed": smoothed if smoothed is not None else people,
         "people": people,
-        "level": level.upper(),
+        "level": str(p.get("level") or "UNKNOWN").upper()[:16],
     }
 
 
@@ -172,38 +169,57 @@ mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="crowd-bac
 mqtt_client.reconnect_delay_set(min_delay=1, max_delay=5)
 
 
+def mqtt_topic_patterns() -> tuple[str, str]:
+    return (
+        f"{MQTT_TOPIC}/+/{MQTT_ONLINE_SUFFIX}",
+        f"{MQTT_TOPIC}/+/{MQTT_COUNTS_SUFFIX}",
+    )
+
+
+def parse_mqtt_topic(topic: str) -> tuple[Optional[str], Optional[str]]:
+    pattern = re.escape(MQTT_TOPIC) + r"/([^/]+)/([^/]+)"
+    match = re.fullmatch(pattern, topic)
+    if match is None:
+        return None, None
+    zone, kind = match.groups()
+    if kind not in (MQTT_ONLINE_SUFFIX, MQTT_COUNTS_SUFFIX):
+        return None, None
+    return zone, kind
+
+
+def normalize_mqtt_counts(payload: Any, zone: str) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+    required = {"devices", "real", "rand", "smoothed", "people", "level"}
+    if set(payload) != required or not isinstance(payload["level"], str):
+        return None
+    if any(num(payload[field]) is None for field in required - {"level"}):
+        return None
+    return normalize(payload, zone)
+
+
 def on_connect(client, userdata, flags, reason_code, properties):
     print(f"MQTT connected to {MQTT_HOST}:{MQTT_PORT} ({reason_code})")
-    client.subscribe(f"{MQTT_TOPIC}/+/online")
-    client.subscribe(f"{MQTT_TOPIC}/+/counts")
-
-
-def parse_topic(topic: str) -> tuple[Optional[str], Optional[str]]:
-    prefix = f"{MQTT_TOPIC}/"
-    parts = topic.split("/")
-    if not topic.startswith(prefix) or len(parts) != 3 or parts[2] not in {"online", "counts"}:
-        return None, None
-    zone = parts[1]
-    return (zone, parts[2]) if zone else (None, None)
+    client.subscribe([(pattern, 0) for pattern in mqtt_topic_patterns()])
 
 
 def on_message(client, userdata, msg):
     try:
-        zone, kind = parse_topic(msg.topic)
-        if zone is None:
-            print("MQTT: ignored unsupported topic:", msg.topic)
+        zone, kind = parse_mqtt_topic(msg.topic)
+        if zone is None or kind is None:
+            print("MQTT: ignored unexpected topic:", msg.topic)
             return
-        payload = msg.payload.decode("utf-8", "strict")
-        if kind == "online":
-            if payload != "online":
-                print("MQTT: ignored invalid online payload for", zone)
+        if kind == MQTT_ONLINE_SUFFIX:
+            if msg.payload != b"online":
+                print("MQTT: ignored invalid online payload:", msg.payload[:120])
                 return
-            zone_online[zone] = True
-            broadcast("online", {"zone": zone, "online": True})
+            broadcast("online", {"zone": zone, "status": "online"})
+            print(f"MQTT: {zone} online")
             return
-        r = normalize(json.loads(payload), zone)
+        payload = json.loads(msg.payload.decode("utf-8", "replace"))
+        r = normalize_mqtt_counts(payload, zone)
         if r is None:
-            print("MQTT: ignored invalid counts payload for", zone)
+            print("MQTT: ignored invalid counts payload:", msg.payload[:120])
             return
         save_readings([r])
     except Exception as e:  # keep the MQTT thread alive on bad input
