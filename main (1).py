@@ -9,6 +9,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -30,12 +31,14 @@ PORT = int(os.getenv("PORT", "3000"))
 DB_PATH = os.getenv("DB_PATH", "./crowd.db")
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_TOPIC = os.getenv("MQTT_TOPIC", "wifi/congestion")  # base topic; zone = suffix
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "congestion").strip("/")  # base topic; topics are base/zone/kind
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
 STALE_MS = int(os.getenv("STALE_MS", "60000"))
 MODES = ("normal", "evacuation")
 ROUTE_INTERVAL = float(os.getenv("ROUTE_INTERVAL", "3"))  # seconds between route recomputes
 SEED_DEMO = os.getenv("SEED_DEMO", "1") == "1"  # seed a demo building layout if none exists
+MQTT_COUNT_FIELDS = frozenset(("devices", "real", "rand", "smoothed", "people", "level"))
+MQTT_TOPIC_PATTERN = re.compile(rf"^{re.escape(MQTT_TOPIC)}/([^/]+)/([^/]+)$")
 
 # ---------- Database ----------
 SCHEMA = """
@@ -78,6 +81,7 @@ VALUES (:zone, :ts, :devices, :real_devices, :rand_devices, :smoothed, :people, 
 # ---------- Live stream (SSE) ----------
 subscribers: set = set()
 main_loop: Optional[asyncio.AbstractEventLoop] = None
+online_zones: dict[str, bool] = {}
 
 
 def broadcast(event: str, data: dict) -> None:
@@ -166,17 +170,48 @@ mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="crowd-bac
 mqtt_client.reconnect_delay_set(min_delay=1, max_delay=5)
 
 
+def mqtt_topic_parts(topic: str) -> Optional[tuple[str, str]]:
+    match = MQTT_TOPIC_PATTERN.fullmatch(topic)
+    return (match.group(1), match.group(2)) if match else None
+
+
+def strict_counts(payload: Any) -> Optional[dict]:
+    if not isinstance(payload, dict) or set(payload) != MQTT_COUNT_FIELDS:
+        return None
+    if any(num(payload[field]) is None for field in MQTT_COUNT_FIELDS - {"level"}):
+        return None
+    if not isinstance(payload["level"], str) or not payload["level"]:
+        return None
+    return payload
+
+
 def on_connect(client, userdata, flags, reason_code, properties):
     print(f"MQTT connected to {MQTT_HOST}:{MQTT_PORT} ({reason_code})")
-    client.subscribe(f"{MQTT_TOPIC}/#")
+    client.subscribe(f"{MQTT_TOPIC}/+/+")
 
 
 def on_message(client, userdata, msg):
     try:
-        zone = msg.topic[len(MQTT_TOPIC) + 1:] if len(msg.topic) > len(MQTT_TOPIC) else None
-        r = normalize(json.loads(msg.payload.decode("utf-8", "replace")), zone)
+        topic = mqtt_topic_parts(msg.topic)
+        if topic is None:
+            print("MQTT: ignored invalid topic:", msg.topic)
+            return
+        zone, kind = topic
+        payload = msg.payload.decode("utf-8", "replace").strip()
+        if kind == "online":
+            if payload != "online":
+                print("MQTT: ignored invalid online payload:", msg.payload[:120])
+                return
+            online_zones[zone] = True
+            broadcast("online", {"zone": zone, "online": True})
+            return
+        if kind != "counts":
+            print("MQTT: ignored unsupported topic:", msg.topic)
+            return
+        counts = strict_counts(json.loads(payload))
+        r = normalize(counts, zone) if counts is not None else None
         if r is None:
-            print("MQTT: ignored invalid payload:", msg.payload[:120])
+            print("MQTT: ignored invalid counts payload:", msg.payload[:120])
             return
         save_readings([r])
     except Exception as e:  # keep the MQTT thread alive on bad input
